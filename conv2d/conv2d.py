@@ -12,13 +12,18 @@ import torch
     Input shape:
         N -> batch size
         C -> number of input channels
-        H -> input height
-        W -> input width
+        H -> height of each input feature map
+        W -> width of each input feature map
 
     Output shape:
-        K -> number of output channels (filters)
-        P -> output height
-        Q -> output width
+        N -> batch size
+        K -> number of output channels, number of conv filters to apply
+        P -> output height of feature map
+        Q -> output width of feature map
+
+    Weigh/Filter shape:
+        K -> number of output channels (Number of feature map produced by the conv layer)
+        C -> number of input channels (Number of feature map coming into the conv layer)
         R -> filter height
         S -> filter width
 
