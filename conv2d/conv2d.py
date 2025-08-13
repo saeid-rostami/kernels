@@ -41,23 +41,16 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
 
 @triton.autotune(
     configs=[
-        # ---- Robust (HOIST=0) ----
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=2),  # keep LDS sane
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=2, num_stages=3),
-
-        # RDNA wave32 occupancy bump (still robust)
+        # Robust tiles (wave32 variants included)
         triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
 
-        # ---- HOIST on (only triggers when (R*S) | BLOCK_K) ----
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=2),
+        # Slightly deeper K tile (watch LDS; keep stages low)
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=2),
 
-        # ---- Tiny / tail-friendly ----
+        # Small / tail-friendly
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
     ],
