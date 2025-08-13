@@ -395,6 +395,40 @@ def _bench_case(shape, stride=(1,1), padding=(0,0), dilation=(1,1),
           f"time={dt*1e3:.3f} ms  thru={flops/dt/1e12:.2f} TFLOP/s")
 
 
+@torch.inference_mode()
+def _bench_pytorch_case(shape, stride=(1,1), padding=(0,0), dilation=(1,1), activation='relu',
+                        warmup=10, iters=50):
+    dev = torch.device('cuda'); dtype = torch.float16
+    N, C, H, W, K, R, S = shape
+
+    # PyTorch expects NCHW
+    x = torch.randn(N, C, H, W, dtype=dtype, device=dev)
+    w = torch.randn(K, C, R, S, dtype=dtype, device=dev)
+    b = torch.randn(K, dtype=dtype, device=dev)
+
+    # warmup: builds MIOpen heuristics cache & graph, etc.
+    for _ in range(warmup):
+        y = F.conv2d(x, w, bias=b, stride=stride, padding=padding, dilation=dilation)
+        if activation == 'relu':
+            y = torch.relu(y)
+    torch.cuda.synchronize()
+
+    t0 = time.time()
+    for _ in range(iters):
+        y = F.conv2d(x, w, bias=b, stride=stride, padding=padding, dilation=dilation)
+        if activation == 'relu':
+            y = torch.relu(y)
+    torch.cuda.synchronize()
+    dt = (time.time() - t0) / iters
+
+    P = (H + 2*padding[0] - dilation[0]*(R-1) - 1) // stride[0] + 1
+    Q = (W + 2*padding[1] - dilation[1]*(S-1) - 1) // stride[1] + 1
+    flops = 2.0 * N * K * P * Q * C * R * S
+    print(f"[pytorch] {shape} stride={stride} pad={padding} dil={dilation} "
+          f"time={dt*1e3:.3f} ms  thru={flops/dt/1e12:.2f} TFLOP/s")
+    return dt, flops
+                            
+
 def compare_triton_vs_pytorch(shape, stride=(1,1), padding=(0,0), dilation=(1,1),
                               activation='relu', layout='nchw', prepack=True, pad_multiple=64,
                               warmup=10, iters=50):
