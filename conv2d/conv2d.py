@@ -27,6 +27,14 @@ def prepack_weights_crs_k(w: torch.Tensor, pad_multiple: int = 64):
     return wp, CRS_pad
 
 
+# ---- global weight-pack cache ----
+_WPACK_CACHE = {}
+
+def _wpack_key(w: torch.Tensor, pad_multiple: int):
+    # Key guards against aliasing: ptr + shape + dtype + device + pad_multiple
+    return (int(w.data_ptr()), tuple(w.shape), str(w.dtype), str(w.device), int(pad_multiple))
+
+
 # =========================
 # Triton kernel (toggle: packed weights, NHWC input)
 # =========================
@@ -80,10 +88,8 @@ def _conv2d_fwd(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # ---- B (weights) descriptor: rows = GEMM_K, cols = K
-    # Packed layout is a contiguous 2D tensor [GEMM_K, K] (row-major):
-    #   row stride = K, col stride = 1
-    # Original layout [K, C, R, S] viewed as (CRS, K):
-    #   row stride = 1 (advance over S/R/C), col stride = C*R*S
+    # Packed layout [GEMM_K, K] contiguous row-major: row_stride=K, col_stride=1
+    # Original layout [K,C,R,S] viewed as (CRS, K): row_stride=1, col_stride=C*R*S
     if packed:
         row_stride = K
         col_stride = 1
@@ -107,7 +113,6 @@ def _conv2d_fwd(
         offs_k = k_tile + tl.arange(0, BLOCK_K)   # [BK] reduction indices 0..GEMM_K-1
 
         # Project offs_k into (c,r,s) for reading A (input)
-        # Note: even when weights are prepacked, A still uses (c,r,s)
         c  = offs_k // (R * S)
         rs = offs_k %  (R * S)
         r  = rs // S
@@ -140,7 +145,7 @@ def _conv2d_fwd(
         )
         A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)  # [BM,BK], fp16
 
-        # Weights: advance along rows by k_tile; guard both rows/cols for tails
+        # Weights: advance along rows by k_tile; guard rows/cols for tails
         w_desc_k = tl.advance(w_desc, (k_tile, 0))
         B = tl.load(w_desc_k, boundary_check=(0, 1), padding_option='zero')  # [BK,BN], fp16
 
@@ -192,7 +197,13 @@ def conv2d_fwd(x, w, b=None, stride=(1,1), padding=(0,0), dilation=(1,1),
     GEMM_N = K
 
     if prepack:
-        wp, CRS_pad = prepack_weights_crs_k(w, pad_multiple=pad_multiple)
+        key = _wpack_key(w, pad_multiple)
+        entry = _WPACK_CACHE.get(key)
+        if entry is None or (not entry[0].is_cuda) or (entry[0].device != w.device):
+            wp, CRS_pad = prepack_weights_crs_k(w, pad_multiple=pad_multiple)
+            _WPACK_CACHE[key] = (wp, CRS_pad)
+        else:
+            wp, CRS_pad = entry
         w_used = wp
         GEMM_K = CRS_pad
         packed = True
