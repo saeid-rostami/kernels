@@ -64,15 +64,17 @@ def _conv2d_fwd(
     tl.multiple_of(offs_n, 16)
     tl.max_contiguous(offs_n, BLOCK_N)
 
+    # Use a SCALAR column start for this program's BN tile
+    col_start = (pid_n * BLOCK_N).to(tl.int32)
+
     w_desc = tl.make_block_ptr(
         base=w_ptr,
         shape=(C * R * S, K),          # rows, cols
         strides=(1, stride_k),         # row stride over s/r/c, col stride over K
-        offsets=(0, offs_n),           # <-- use the whole offs_n vector (no [0])
+        offsets=(0, col_start),        # <-- scalar start column
         block_shape=(BLOCK_K, BLOCK_N),
         order=(1, 0),
     )
-
 
     # ----------------- K loop (robust for any R,S and BLOCK_K) -----------------
     for k_tile in range(0, GEMM_K, BLOCK_K):
