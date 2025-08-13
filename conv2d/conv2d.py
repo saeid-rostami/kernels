@@ -80,16 +80,23 @@ def _conv2d_fwd(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # ---- B (weights) descriptor: rows = GEMM_K, cols = K
+    # Packed layout is a contiguous 2D tensor [GEMM_K, K] (row-major):
+    #   row stride = K, col stride = 1
+    # Original layout [K, C, R, S] viewed as (CRS, K):
+    #   row stride = 1 (advance over S/R/C), col stride = C*R*S
     if packed:
-        stride_k = GEMM_K  # packed layout is [GEMM_K, K] contiguous
+        row_stride = K
+        col_stride = 1
     else:
-        stride_k = C * R * S  # original layout [K,C,R,S] viewed as (CRS, K)
+        row_stride = 1
+        col_stride = C * R * S
 
     col_start = (pid_n * BLOCK_N).to(tl.int32)  # scalar BN tile start
+
     w_desc = tl.make_block_ptr(
         base=w_ptr,
         shape=(GEMM_K, K),
-        strides=(1, stride_k),
+        strides=(row_stride, col_stride),
         offsets=(0, col_start),
         block_shape=(BLOCK_K, BLOCK_N),
         order=(1, 0),
