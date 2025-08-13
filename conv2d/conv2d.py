@@ -395,6 +395,41 @@ def _bench_case(shape, stride=(1,1), padding=(0,0), dilation=(1,1),
           f"time={dt*1e3:.3f} ms  thru={flops/dt/1e12:.2f} TFLOP/s")
 
 
+def compare_triton_vs_pytorch(shape, stride=(1,1), padding=(0,0), dilation=(1,1),
+                              activation='relu', layout='nchw', prepack=True, pad_multiple=64,
+                              warmup=10, iters=50):
+    # Triton (your kernel)
+    _ = _bench_case(shape, stride, padding, dilation, activation, layout, prepack, pad_multiple,
+                    warmup=warmup, iters=iters)
+    # PyTorch (MIOpen on ROCm)
+    dt_torch, flops = _bench_pytorch_case(shape, stride, padding, dilation, activation,
+                                          warmup=warmup, iters=iters)
+    # Optional: compute last Triton time by re-running once (cheap) to get dt
+    dev = torch.device('cuda'); dtype = torch.float16
+    N, C, H, W, K, R, S = shape
+    if layout == 'nhwc':
+        x_nchw = torch.randn(N, C, H, W, dtype=dtype, device=dev)
+        x = x_nchw.permute(0,2,3,1).contiguous()
+    else:
+        x = torch.randn(N, C, H, W, dtype=dtype, device=dev)
+    w = torch.randn(K, C, R, S, dtype=dtype, device=dev)
+    b = torch.randn(K, dtype=dtype, device=dev)
+
+    # measure Triton once more to get dt directly
+    for _ in range(5):
+        _ = conv2d_fwd(x, w, b, stride, padding, dilation, activation, layout, prepack, pad_multiple)
+    torch.cuda.synchronize()
+    t0 = time.time()
+    iters = 50
+    for _ in range(iters):
+        _ = conv2d_fwd(x, w, b, stride, padding, dilation, activation, layout, prepack, pad_multiple)
+    torch.cuda.synchronize()
+    dt_triton = (time.time() - t0) / iters
+
+    print(f"[compare] Triton/PyTorch speedup: {dt_torch/dt_triton:.2f}× "
+          f"(Triton {dt_triton*1e3:.3f} ms vs Torch {dt_torch*1e3:.3f} ms)")
+                                  
+
 if __name__ == "__main__":
     # Baseline (NCHW, no prepack)
     s = (2, 64, 56, 56, 128, 3, 3)
@@ -413,3 +448,7 @@ if __name__ == "__main__":
     s2 = (1, 13, 31, 29, 17, 3, 3)
     _check_case(s2, stride=(2,2), padding=(1,1), dilation=(1,1), layout='nchw', prepack=True, pad_multiple=64)
     _bench_case(s2,  stride=(2,2), padding=(1,1), dilation=(1,1), layout='nchw', prepack=True, pad_multiple=64)
+
+    s = (2, 64, 56, 56, 128, 3, 3)
+        compare_triton_vs_pytorch(s, stride=(1,1), padding=(1,1), dilation=(1,1),
+                                  activation='relu', layout='nhwc', prepack=True)
