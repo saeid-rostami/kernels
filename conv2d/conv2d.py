@@ -48,15 +48,24 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
 
-        # ---- HOIST on (good when RS-pattern repeats per K-tile) ----
-        # RDNA (wave32): use more warps for higher occupancy
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=4, num_stages=3),
+        # Robust wave32 variant (RDNA occupancy bump)
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
+
+        # ---- HOIST on (only helps when BK % (R*S) == 0) ----
+        # 3x3 -> R*S=9; choose BK multiple of 9 and 16 => 144
+        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':144, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':144, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=2),
+
+        # Another HOIST option: BK=96 (multiple of 16; good tradeoff on some shapes)
+        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K': 96, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
+
+        # ---- Tiny / tail-friendly tiles ----
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
     ],
     key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
 )
+
 @triton.jit
 def _conv2d_fwd(
     out_ptr, in_ptr, w_ptr, bias_ptr,
