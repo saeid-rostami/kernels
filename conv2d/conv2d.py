@@ -450,5 +450,5 @@ if __name__ == "__main__":
     _bench_case(s2,  stride=(2,2), padding=(1,1), dilation=(1,1), layout='nchw', prepack=True, pad_multiple=64)
 
     s = (2, 64, 56, 56, 128, 3, 3)
-        compare_triton_vs_pytorch(s, stride=(1,1), padding=(1,1), dilation=(1,1),
-                                  activation='relu', layout='nhwc', prepack=True)
+    compare_triton_vs_pytorch(s, stride=(1,1), padding=(1,1), dilation=(1,1),
+                            activation='relu', layout='nhwc', prepack=True)
