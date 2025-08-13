@@ -41,21 +41,23 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
 
 @triton.autotune(
     configs=[
-        # Robust tiles, all wave32 x 4-warp (≈128 threads per workgroup)
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        # deeper K tile (keep stages low to limit LDS)
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=2),
+        # --- NCHW / no-prepack champs (keep these) ---
+        triton.Config({'BLOCK_M':128,'BLOCK_N':128,'BLOCK_K':64, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M':128,'BLOCK_N': 64,'BLOCK_K':64, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64,'BLOCK_N':128,'BLOCK_K':64, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M':128,'BLOCK_N':128,'BLOCK_K':128,'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=2),
 
-        # small / tail-friendly
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
+        # --- NHWC + prepack friendly (BN=64, lighter staging) ---
+        triton.Config({'BLOCK_M':128,'BLOCK_N': 64,'BLOCK_K':64, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,'BLOCK_N': 64,'BLOCK_K':64, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=3),
+
+        # --- small / tail tiles ---
+        triton.Config({'BLOCK_M': 64,'BLOCK_N': 64,'BLOCK_K':32, 'GROUP_SIZE_M':8,'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 32,'BLOCK_N': 64,'BLOCK_K':32, 'GROUP_SIZE_M':4,'HOIST':0}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_M': 32,'BLOCK_N': 32,'BLOCK_K':32, 'GROUP_SIZE_M':4,'HOIST':0}, num_warps=2, num_stages=3),
     ],
-    key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
+    key=['GEMM_M','GEMM_N','GEMM_K','packed','use_nhwc','HOIST'],
 )
-
 
 
 @triton.jit
