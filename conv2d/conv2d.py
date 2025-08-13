@@ -36,16 +36,25 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
 
 
 # =========================
-# Triton kernel (toggle: packed weights, NHWC input)
+# Triton kernel (toggle: packed weights, NHWC input, HOIST)
 # =========================
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8}, num_warps=2, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8}, num_warps=4, num_stages=3),
+        # ---- Robust (HOIST=0) ----
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+
+        # ---- HOIST on (K-tiles repeat (r,s); good for 3x3 etc.) ----
+        # RDNA (wave32): try more warps for higher occupancy
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
+        # Lower-latency HOIST option
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=4, num_stages=3),
     ],
     key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
 )
@@ -59,6 +68,7 @@ def _conv2d_fwd(
     GEMM_M, GEMM_N, GEMM_K,                              # M = N*P*Q, N = K, K = CRS or CRS_pad
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    HOIST: tl.constexpr,                                 # <--- NEW
 ):
     # MFMA-friendly shapes
     tl.static_assert(BLOCK_M % 16 == 0)
@@ -108,44 +118,82 @@ def _conv2d_fwd(
         order=(1, 0),
     )
 
-    # ----------------- K loop (robust) -----------------
+    # -------------- Optional HOIST precompute (for RS pattern) --------------
+    # Valid when BLOCK_K % (R*S) == 0 so each tile repeats the same (r,s) pattern.
+    hoist_ok = (BLOCK_K % (R * S)) == 0
+
+    # Local RS pattern for this tile (independent of k_tile)
+    k_idx = tl.arange(0, BLOCK_K)
+    c_loc = k_idx // (R * S)
+    rs    = k_idx %  (R * S)
+    r_loc = rs // S
+    s_loc = rs %  S
+
+    # Precompute input spatial positions and HW mask (independent of channels)
+    h_in_base = p[:, None] * stride_h + r_loc[None, :] * dil_h - pad_h
+    w_in_base = q[:, None] * stride_w + s_loc[None, :] * dil_w - pad_w
+    a_mask_hw = (h_in_base >= 0) & (h_in_base < H) & (w_in_base >= 0) & (w_in_base < W)
+    n_mask    = (n[:, None] < N)
+
+    # --------------------------- K loop ---------------------------
     for k_tile in range(0, GEMM_K, BLOCK_K):
-        offs_k = k_tile + tl.arange(0, BLOCK_K)   # [BK] reduction indices 0..GEMM_K-1
+        if HOIST and hoist_ok:
+            # channels for this K-slice
+            c_base = (k_tile // (R * S))
+            c_cur  = c_base + c_loc
 
-        # Project offs_k into (c,r,s) for reading A (input)
-        c  = offs_k // (R * S)
-        rs = offs_k %  (R * S)
-        r  = rs // S
-        s  = rs %  S
+            if use_nhwc:
+                # x layout: [N, H, W, C]
+                a_offs = (
+                    n[:, None] * (H * W * C) +
+                    h_in_base * (W * C) +
+                    w_in_base * C +
+                    c_cur[None, :]
+                ).to(tl.int32)
+            else:
+                # x layout: [N, C, H, W]
+                a_offs = (
+                    n[:, None] * (C * H * W) +
+                    c_cur[None, :] * (H * W) +
+                    h_in_base * W + w_in_base
+                ).to(tl.int32)
 
-        # Input coordinates for this tile
-        h_in = p[:, None] * stride_h + r[None, :] * dil_h - pad_h
-        w_in = q[:, None] * stride_w + s[None, :] * dil_w - pad_w
+            a_mask = n_mask & a_mask_hw & (c_cur[None, :] < C)
+            A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)
 
-        if use_nhwc:
-            # x layout: [N, H, W, C]
-            a_offs = (
-                n[:, None] * (H * W * C) +
-                h_in * (W * C) +
-                w_in * C +
-                c[None, :]
-            ).to(tl.int32)
         else:
-            # x layout: [N, C, H, W]
-            a_offs = (
-                n[:, None] * (C * H * W) +
-                c[None, :] * (H * W) +
-                h_in * W + w_in
-            ).to(tl.int32)
+            # Robust path (works for any BLOCK_K, R, S)
+            offs_k = k_tile + tl.arange(0, BLOCK_K)
+            c  = offs_k // (R * S)
+            rs = offs_k %  (R * S)
+            r  = rs // S
+            s  = rs %  S
 
-        a_mask = (
-            (n[:, None] < N) & (c[None, :] < C) &
-            (h_in >= 0) & (h_in < H) &
-            (w_in >= 0) & (w_in < W)
-        )
-        A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)  # [BM,BK], fp16
+            h_in = p[:, None] * stride_h + r[None, :] * dil_h - pad_h
+            w_in = q[:, None] * stride_w + s[None, :] * dil_w - pad_w
 
-        # Weights: advance along rows by k_tile; guard rows/cols for tails
+            if use_nhwc:
+                a_offs = (
+                    n[:, None] * (H * W * C) +
+                    h_in * (W * C) +
+                    w_in * C +
+                    c[None, :]
+                ).to(tl.int32)
+            else:
+                a_offs = (
+                    n[:, None] * (C * H * W) +
+                    c[None, :] * (H * W) +
+                    h_in * W + w_in
+                ).to(tl.int32)
+
+            a_mask = (
+                (n[:, None] < N) & (c[None, :] < C) &
+                (h_in >= 0) & (h_in < H) &
+                (w_in >= 0) & (w_in < W)
+            )
+            A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)
+
+        # Weights (advance along rows by k_tile; guard rows/cols for tails)
         w_desc_k = tl.advance(w_desc, (k_tile, 0))
         B = tl.load(w_desc_k, boundary_check=(0, 1), padding_option='zero')  # [BK,BN], fp16
 
