@@ -48,12 +48,11 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
 
-        # ---- HOIST on (K-tiles repeat (r,s); good for 3x3 etc.) ----
-        # RDNA (wave32): try more warps for higher occupancy
+        # ---- HOIST on (good when RS-pattern repeats per K-tile) ----
+        # RDNA (wave32): use more warps for higher occupancy
         triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=8, num_stages=3),
-        # Lower-latency HOIST option
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':1}, num_warps=4, num_stages=3),
     ],
     key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
@@ -98,8 +97,8 @@ def _conv2d_fwd(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # ---- B (weights) descriptor: rows = GEMM_K, cols = K
-    # Packed layout [GEMM_K, K] contiguous row-major: row_stride=K, col_stride=1
-    # Original layout [K,C,R,S] viewed as (CRS, K): row_stride=1, col_stride=C*R*S
+    # Packed [GEMM_K, K] contiguous row-major: row_stride=K, col_stride=1
+    # Original [K,C,R,S] viewed as (CRS, K): row_stride=1, col_stride=C*R*S
     if packed:
         row_stride = K
         col_stride = 1
@@ -119,8 +118,10 @@ def _conv2d_fwd(
     )
 
     # -------------- Optional HOIST precompute (for RS pattern) --------------
-    # Valid when BLOCK_K % (R*S) == 0 so each tile repeats the same (r,s) pattern.
-    hoist_ok = (BLOCK_K % (R * S)) == 0
+    # Build a proper scalar bool: hoist_ok = (BLOCK_K % (R*S) == 0)
+    # Use a scalar tensor to keep types correct.
+    bk_scalar = tl.full((), BLOCK_K, tl.int32)
+    hoist_ok = (bk_scalar % (R * S)) == 0  # tl.int1 scalar
 
     # Local RS pattern for this tile (independent of k_tile)
     k_idx = tl.arange(0, BLOCK_K)
@@ -137,32 +138,63 @@ def _conv2d_fwd(
 
     # --------------------------- K loop ---------------------------
     for k_tile in range(0, GEMM_K, BLOCK_K):
-        if HOIST and hoist_ok:
-            # channels for this K-slice
-            c_base = (k_tile // (R * S))
-            c_cur  = c_base + c_loc
+        if HOIST:
+            if hoist_ok:
+                # channels for this K-slice
+                c_base = (k_tile // (R * S))
+                c_cur  = c_base + c_loc
 
-            if use_nhwc:
-                # x layout: [N, H, W, C]
-                a_offs = (
-                    n[:, None] * (H * W * C) +
-                    h_in_base * (W * C) +
-                    w_in_base * C +
-                    c_cur[None, :]
-                ).to(tl.int32)
+                if use_nhwc:
+                    # x layout: [N, H, W, C]
+                    a_offs = (
+                        n[:, None] * (H * W * C) +
+                        h_in_base * (W * C) +
+                        w_in_base * C +
+                        c_cur[None, :]
+                    ).to(tl.int32)
+                else:
+                    # x layout: [N, C, H, W]
+                    a_offs = (
+                        n[:, None] * (C * H * W) +
+                        c_cur[None, :] * (H * W) +
+                        h_in_base * W + w_in_base
+                    ).to(tl.int32)
+
+                a_mask = n_mask & a_mask_hw & (c_cur[None, :] < C)
+                A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)
             else:
-                # x layout: [N, C, H, W]
-                a_offs = (
-                    n[:, None] * (C * H * W) +
-                    c_cur[None, :] * (H * W) +
-                    h_in_base * W + w_in_base
-                ).to(tl.int32)
+                # Fallback robust path
+                offs_k = k_tile + tl.arange(0, BLOCK_K)
+                c  = offs_k // (R * S)
+                rs = offs_k %  (R * S)
+                r  = rs // S
+                s  = rs %  S
 
-            a_mask = n_mask & a_mask_hw & (c_cur[None, :] < C)
-            A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)
+                h_in = p[:, None] * stride_h + r[None, :] * dil_h - pad_h
+                w_in = q[:, None] * stride_w + s[None, :] * dil_w - pad_w
 
+                if use_nhwc:
+                    a_offs = (
+                        n[:, None] * (H * W * C) +
+                        h_in * (W * C) +
+                        w_in * C +
+                        c[None, :]
+                    ).to(tl.int32)
+                else:
+                    a_offs = (
+                        n[:, None] * (C * H * W) +
+                        c[None, :] * (H * W) +
+                        h_in * W + w_in
+                    ).to(tl.int32)
+
+                a_mask = (
+                    (n[:, None] < N) & (c[None, :] < C) &
+                    (h_in >= 0) & (h_in < H) &
+                    (w_in >= 0) & (w_in < W)
+                )
+                A = tl.load(in_ptr + a_offs, mask=a_mask, other=0.0)
         else:
-            # Robust path (works for any BLOCK_K, R, S)
+            # Robust path (HOIST disabled)
             offs_k = k_tile + tl.arange(0, BLOCK_K)
             c  = offs_k // (R * S)
             rs = offs_k %  (R * S)
