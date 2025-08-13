@@ -41,21 +41,21 @@ def _wpack_key(w: torch.Tensor, pad_multiple: int):
 
 @triton.autotune(
     configs=[
-        # Robust tiles (wave32 variants included)
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=3),
+        # Robust tiles, all wave32 x 4-warp (≈128 threads per workgroup)
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M':128, 'BLOCK_N': 64, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N':128, 'BLOCK_K':64,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
+        # deeper K tile (keep stages low to limit LDS)
+        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=2),
 
-        # Slightly deeper K tile (watch LDS; keep stages low)
-        triton.Config({'BLOCK_M':128, 'BLOCK_N':128, 'BLOCK_K':128, 'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=8, num_stages=2),
-
-        # Small / tail-friendly
+        # small / tail-friendly
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':8, 'HOIST':0}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K':32,  'GROUP_SIZE_M':4, 'HOIST':0}, num_warps=2, num_stages=3),
     ],
     key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
 )
+
 
 
 @triton.jit
