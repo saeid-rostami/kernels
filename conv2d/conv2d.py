@@ -58,9 +58,7 @@ def _conv2d_fwd(
     # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # ---- B (weights) block pointer: rows=(C*R*S), cols=(K) ----
-    # Parent layout: w_ptr[K, C, R, S]
-    # Logical 2D view: [C*R*S, K] — row stride 1 over (s,r,c); col stride = C*R*S.
+    # ---- B (weights) block pointer: rows=(C*R*S), cols=K ----
     stride_k = C * R * S
     tl.multiple_of(stride_k, 16)
     tl.multiple_of(offs_n, 16)
@@ -68,12 +66,13 @@ def _conv2d_fwd(
 
     w_desc = tl.make_block_ptr(
         base=w_ptr,
-        shape=(C * R * S, K),
-        strides=(1, stride_k),
-        offsets=(0, offs_n[0]),              # start column = first k of this tile
+        shape=(C * R * S, K),          # rows, cols
+        strides=(1, stride_k),         # row stride over s/r/c, col stride over K
+        offsets=(0, offs_n),           # <-- use the whole offs_n vector (no [0])
         block_shape=(BLOCK_K, BLOCK_N),
-        order=(1, 0),                        # column-major for coalesced K loads
+        order=(1, 0),
     )
+
 
     # ----------------- K loop (robust for any R,S and BLOCK_K) -----------------
     for k_tile in range(0, GEMM_K, BLOCK_K):
