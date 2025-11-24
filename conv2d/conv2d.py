@@ -17,6 +17,7 @@ except Exception:
     tl = None
 
 
+
 def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int, ref: torch.Tensor):
     eps = {torch.float16: 2**-10, torch.bfloat16: 2**-7, torch.float32: 2**-23}.get(dtype, 2**-10)
     rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
@@ -87,13 +88,10 @@ if triton is not None:
         return (e2x - 1) / (e2x + 1)
 
     AUTOTUNE_CONFIGS = [
-        # 1x1 / GEMM-like (large K_out, large reduction)
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=3),
-        # 3x3 @ 56x56 family (more mem pressure)
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=3),
-        # fallback small-K
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_SIZE_M": 4}, num_warps=4, num_stages=3),
     ]
 
@@ -112,9 +110,8 @@ if triton is not None:
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, HAS_BIAS: tl.constexpr, ACT_TYPE: tl.constexpr,
     ):
-
         pid  = tl.program_id(axis=0)
-        nprog = tl.num_programs(0)  
+        nprog = tl.num_programs(0) 
 
         num_pid_m = tl.cdiv(N * P * Q, BLOCK_M)
         num_pid_n = tl.cdiv(K_out,     BLOCK_N)
@@ -286,7 +283,6 @@ def conv2d_nchw_channels_last(x, w_oihw, bias=None, stride=(1,1), padding=(0,0),
                    stride, padding, dilation, out_dtype, block_k, activation, y_layout="nhwc")
     return y
 
-
 @dataclass
 class TestResult:
     name: str
@@ -297,13 +293,14 @@ class TestResult:
 
 class TestSuite:
     def __init__(self, device: str, dtype: torch.dtype, verbose=True, bench_enabled=False,
-                 print_shapes=True, fp32_audit=False):
+                 print_shapes=True, fp32_audit=False, y_layout_mode: str = "both"):
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
         self.bench_enabled = bench_enabled
         self.print_shapes = print_shapes
         self.fp32_audit = fp32_audit
+        self.y_layout_mode = y_layout_mode
         self.results: List[TestResult] = []
         self.bench_records: List[Dict[str, float]] = []
         self.total_flops_tri = 0.0
@@ -379,8 +376,6 @@ class TestSuite:
             print(f"  Torch  : {eff_th:6.2f} TF/s   (sum FLOPs / sum time)")
         return passed == total
 
-# ======================== Tests ========================
-
 def get_edge_case_shapes():
     return [
         (1,3,7,7,8, 3,3,(1,1),(1,1),(1,1),"3x3 same padding"),
@@ -396,16 +391,28 @@ def run_bench_case(suite, x, w, b, stride, padding, dilation, activation, name):
     P,Q = _out_hw(H, W, R, S, stride, padding, dilation)
     total_flops = flops_conv(N,C,H,W,K_out,R,S,P,Q)
 
-    def fn_torch():
-        _ = F.conv2d(x, w, b.to(dtype=suite.dtype) if b is not None else None,
-                     stride=stride, padding=padding, dilation=dilation)
+    def bench_pair(layout_label: str):
+        def fn_torch():
+            _ = F.conv2d(x, w, b.to(dtype=suite.dtype) if b is not None else None,
+                         stride=stride, padding=padding, dilation=dilation)
+        def fn_triton():
+            if layout_label == "NHWC":
+                _ = conv2d_nchw_channels_last(x, w, b, stride, padding, dilation,
+                                              activation="none", out_dtype=suite.dtype)
+            else:
+                _ = conv2d_nchw(x, w, b, stride, padding, dilation,
+                                activation="none", out_dtype=suite.dtype)
+        ms_tri = _bench_ms(fn_triton, warmup=5, rep=30)
+        ms_th  = _bench_ms(fn_torch,   warmup=5, rep=30)
+        suite.add_bench(f"{name} [{layout_label}]", total_flops, ms_tri, ms_th)
 
-    def fn_triton():
-        _ = conv2d_nchw(x, w, b, stride, padding, dilation, activation="none", out_dtype=suite.dtype)
-
-    ms_tri = _bench_ms(fn_triton, warmup=5, rep=30)
-    ms_th  = _bench_ms(fn_torch,   warmup=5, rep=30)
-    suite.add_bench(name, total_flops, ms_tri, ms_th)
+    mode = getattr(suite, "y_layout_mode", "both")
+    if mode == "both":
+        bench_pair("NCHW"); bench_pair("NHWC")
+    elif mode == "nhwc":
+        bench_pair("NHWC")
+    else:
+        bench_pair("NCHW")
 
 def test_edge_cases(suite: TestSuite, activation: str = "none"):
     print("\n" + "="*80); print(f"EDGE CASE TESTS (activation={activation})"); print("="*80)
@@ -415,13 +422,24 @@ def test_edge_cases(suite: TestSuite, activation: str = "none"):
         x = torch.randn((N,C,H,W), device=suite.device, dtype=suite.dtype)
         w = torch.randn((K_out,C,R,S), device=suite.device, dtype=suite.dtype)
         b = torch.randn((K_out,), device=suite.device, dtype=suite.dtype)
-        y_ref = apply_activation(F.conv2d(x,w,b.to(dtype=suite.dtype), stride=stride, padding=padding, dilation=dilation), activation)
-        y_tri = conv2d_nchw(x,w,b,stride,padding,dilation,activation=activation,out_dtype=suite.dtype)
-        if suite.print_shapes:
-            print(f"    {desc}: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{tuple(y_tri.shape)}")
-        suite.check_close(f"{desc} / NCHW", y_tri, y_ref, K_red=C*R*S)
-        if suite.bench_enabled:
-            run_bench_case(suite, x,w,b, stride,padding,dilation, activation, f"{desc}")
+        y_ref_nchw = apply_activation(F.conv2d(x,w,b.to(dtype=suite.dtype), stride=stride, padding=padding, dilation=dilation), activation)
+
+        def check_one(layout_label: str, use_nhwc: bool):
+            if use_nhwc:
+                y_ref = y_ref_nchw.permute(0,2,3,1).contiguous()
+                y_tri = conv2d_nchw_channels_last(x,w,b,stride,padding,dilation,activation=activation,out_dtype=suite.dtype)
+            else:
+                y_ref = y_ref_nchw
+                y_tri = conv2d_nchw(x,w,b,stride,padding,dilation,activation=activation,out_dtype=suite.dtype)
+            if suite.print_shapes:
+                print(f"    {desc} [{layout_label}]: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{tuple(y_tri.shape)}")
+            suite.check_close(f"{desc} / {layout_label}", y_tri, y_ref, K_red=C*R*S)
+            if suite.bench_enabled:
+                run_bench_case(suite, x,w,b, stride,padding,dilation, activation, f"{desc}")
+
+        mode = suite.y_layout_mode if hasattr(suite,"y_layout_mode") else "both"
+        if mode in ("both","nchw"): check_one("NCHW", False)
+        if mode in ("both","nhwc"): check_one("NHWC", True)
 
 def test_random_fuzzing(suite: TestSuite, num_tests=200, activation="none"):
     print("\n" + "="*80); print(f"RANDOM FUZZING TESTS (n={num_tests}, activation={activation})"); print("="*80)
@@ -440,11 +458,23 @@ def test_random_fuzzing(suite: TestSuite, num_tests=200, activation="none"):
             x = torch.randn((N,C,H,W), device=suite.device, dtype=suite.dtype)
             w = torch.randn((K_out,C,R,S), device=suite.device, dtype=suite.dtype)
             b = torch.randn((K_out,), device=suite.device, dtype=suite.dtype)
-            y_ref = apply_activation(F.conv2d(x,w,b.to(dtype=suite.dtype), stride=(sh,sw), padding=(ph,pw), dilation=(dh,dw)), activation)
-            y_tri = conv2d_nchw(x,w,b,(sh,sw),(ph,pw),(dh,dw), activation=activation, out_dtype=suite.dtype)
-            if suite.print_shapes:
-                print(f"    Rand[{i}]: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{tuple(y_tri.shape)}")
-            suite.check_close(f"Random[{i}] ({N},{C},{H},{W})->({N},{K_out},{P},{Q})", y_tri, y_ref, K_red=C*R*S)
+            y_ref_nchw = apply_activation(F.conv2d(x,w,b.to(dtype=suite.dtype), stride=(sh,sw), padding=(ph,pw), dilation=(dh,dw)), activation)
+
+            def check_one(layout_label: str, use_nhwc: bool):
+                if use_nhwc:
+                    y_ref = y_ref_nchw.permute(0,2,3,1).contiguous()
+                    y_tri = conv2d_nchw_channels_last(x,w,b,(sh,sw),(ph,pw),(dh,dw), activation=activation, out_dtype=suite.dtype)
+                else:
+                    y_ref = y_ref_nchw
+                    y_tri = conv2d_nchw(x,w,b,(sh,sw),(ph,pw),(dh,dw), activation=activation, out_dtype=suite.dtype)
+                if suite.print_shapes:
+                    print(f"    Rand[{i}] [{layout_label}]: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{tuple(y_tri.shape)}")
+                suite.check_close(f"Random[{i}] ({N},{C},{H},{W})->({N},{K_out},{P},{Q}) / {layout_label}", y_tri, y_ref, K_red=C*R*S)
+                if suite.bench_enabled:
+                    run_bench_case(suite, x,w,b, (sh,sw),(ph,pw),(dh,dw), activation, f"Random[{i}]")
+            mode = suite.y_layout_mode if hasattr(suite,"y_layout_mode") else "both"
+            if mode in ("both","nchw"): check_one("NCHW", False)
+            if mode in ("both","nhwc"): check_one("NHWC", True)
             if suite.fp32_audit:
                 y_ref32 = F.conv2d(x.float(), w.float(), b.float(), stride=(sh,sw), padding=(ph,pw), dilation=(dh,dw))
                 y_tri32 = conv2d_nchw(x.float(), w.float(), b.float(), (sh,sw), (ph,pw), (dh,dw), activation="none", out_dtype=torch.float32)
@@ -457,7 +487,7 @@ def _resolve_torchvision_weights(tvm, model_name: str, use_pretrained: bool):
     if not use_pretrained:
         return None
     try:
-        from torchvision.models import get_model_weights  
+        from torchvision.models import get_model_weights 
         ws = get_model_weights(model_name)
         if ws is not None and len(ws):
             return getattr(ws, "DEFAULT", next(iter(ws)))
@@ -475,7 +505,6 @@ def _resolve_torchvision_weights(tvm, model_name: str, use_pretrained: bool):
     if enum_name and hasattr(tvm, enum_name):
         enum = getattr(tvm, enum_name)
         return getattr(enum, "DEFAULT", (next(iter(enum)) if len(enum) else None))
-    # Fuzzy fallback
     norm = model_name.replace("_","").lower()
     for attr in dir(tvm):
         if attr.endswith("_Weights"):
@@ -487,7 +516,7 @@ def _resolve_torchvision_weights(tvm, model_name: str, use_pretrained: bool):
 
 def test_models(suite: TestSuite, activation: str = "none", models: Optional[str] = None, num_layers: int = 5, pretrained: bool = False):
     try:
-        from torchvision import models as tvm  # type: ignore
+        from torchvision import models as tvm
     except Exception:
         print("  (skip model tests: torchvision not available)")
         return
@@ -502,7 +531,6 @@ def test_models(suite: TestSuite, activation: str = "none", models: Optional[str
         weights = _resolve_torchvision_weights(tvm, name, pretrained)
         if weights is not None:
             print(f"  (using torchvision pretrained weights for {name}: {weights})")
-        # Construct
         try:
             net = getattr(tvm, name)(weights=weights).to(device=suite.device).eval()
         except Exception as e:
@@ -547,15 +575,39 @@ def test_models(suite: TestSuite, activation: str = "none", models: Optional[str
                 P,Q = _out_hw(H,W,R,S, stride,padding,dilation)
                 print(f"    {name} L{li}: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{(N,K_out,P,Q)}")
 
-            suite.check_close(f"{name} L{li}", y_tri, y_ref, K_red=C*R*S)
+            def _check_model_one(layout_label: str, use_nhwc: bool):
+              """
+              Compare Triton vs Torch for one layer in the requested output layout and,
+              if enabled, run the benchmark. Uses outer-scope vars:
+                x, w, b, stride, padding, dilation, y_ref (Torch NCHW), y_tri (Triton NCHW),
+                suite, C, R, S, name, li
+              """
+              if use_nhwc:
+                  y_ref_use = y_ref.permute(0, 2, 3, 1).contiguous()
+                  y_tri_use = conv2d_nchw_channels_last(
+                      x, w, b, stride, padding, dilation,
+                      activation="none", out_dtype=suite.dtype
+                  )
+              else:
+                  y_ref_use = y_ref
+                  y_tri_use = y_tri
+          
+              suite.check_close(f"{name} L{li} [{layout_label}]", y_tri_use, y_ref_use, K_red=C*R*S)
+          
+              if suite.bench_enabled:
+                  run_bench_case(
+                      suite, x, w, b, stride, padding, dilation,
+                      activation="none", name=f"{name} L{li}"
+                  )
+
+            mode = suite.y_layout_mode if hasattr(suite,"y_layout_mode") else "both"
+            if mode in ("both","nchw"): _check_model_one("NCHW", False)
+            if mode in ("both","nhwc"): _check_model_one("NHWC", True)
 
             if suite.fp32_audit:
                 y_ref32 = F.conv2d(x.float(), w.float(), b.float(), stride=stride, padding=padding, dilation=dilation)
                 y_tri32 = conv2d_nchw(x.float(), w.float(), b.float(), stride, padding, dilation, activation="none", out_dtype=torch.float32)
                 suite.check_close(f"{name} L{li} (FP32 compare)", y_tri32, y_ref32, K_red=C*R*S, rtol=1e-6, atol=1e-6)
-
-            if suite.bench_enabled:
-                run_bench_case(suite, x,w,b, stride,padding,dilation, "none", f"{name} L{li}")
 
 
 def pick_torch_dtype(d: str):
@@ -576,6 +628,7 @@ def main():
     p.add_argument("--bench", action="store_true", help="print TFLOPS per case and summary")
     p.add_argument("--no-print-shapes", action="store_true", help="disable per-case shape prints")
     p.add_argument("--fp32-audit", action="store_true", help="add FP32 reference comparisons")
+    p.add_argument("--y-layout", type=str, default="nchw", choices=["nchw", "nhwc", "both"])
     args = p.parse_args()
 
     torch.set_grad_enabled(False)
@@ -585,7 +638,7 @@ def main():
     print(f"Backend: {backend} | torch device: {device} | dtype: {dtype}")
 
     suite = TestSuite(device=device, dtype=dtype, bench_enabled=args.bench,
-                      print_shapes=not args.no_print_shapes, fp32_audit=args.fp32_audit)
+                      print_shapes=not args.no_print_shapes, fp32_audit=args.fp32_audit, y_layout_mode=args.y_layout)
 
     if args.test_mode in ("edge","all"):
         test_edge_cases(suite)
@@ -601,11 +654,20 @@ def main():
         w = torch.randn((K_out,C,R,S), device=device, dtype=dtype)
         b = torch.randn((K_out,), device=device, dtype=dtype)
         for act in ["none","relu","relu6","gelu"]:
-            y_ref = apply_activation(F.conv2d(x,w,b.to(dtype), stride=stride, padding=padding, dilation=dilation), act)
-            y_tri = conv2d_nchw(x,w,b, stride,padding,dilation, activation=act, out_dtype=dtype)
-            suite.check_close(f"act={act} / NCHW", y_tri, y_ref, K_red=C*R*S)
-            if args.bench:
-                run_bench_case(suite, x,w,b, stride,padding,dilation, act, f"act={act}")
+            y_ref_nchw = apply_activation(F.conv2d(x,w,b.to(dtype), stride=stride, padding=padding, dilation=dilation), act)
+            def check_one(layout_label: str, use_nhwc: bool):
+                if use_nhwc:
+                    y_ref = y_ref_nchw.permute(0,2,3,1).contiguous()
+                    y_tri = conv2d_nchw_channels_last(x,w,b, stride,padding,dilation, activation=act, out_dtype=dtype)
+                else:
+                    y_ref = y_ref_nchw
+                    y_tri = conv2d_nchw(x,w,b, stride,padding,dilation, activation=act, out_dtype=dtype)
+                suite.check_close(f"act={act} / {layout_label}", y_tri, y_ref, K_red=C*R*S)
+                if args.bench:
+                    run_bench_case(suite, x,w,b, stride,padding,dilation, act, f"act={act}")
+            mode = suite.y_layout_mode if hasattr(suite,"y_layout_mode") else "both"
+            if mode in ("both","nchw"): check_one("NCHW", False)
+            if mode in ("both","nhwc"): check_one("NHWC", True)
     if args.test_mode in ("models","all"):
         test_models(suite, models=args.models, num_layers=args.num_layers, pretrained=args.pretrained)
 
