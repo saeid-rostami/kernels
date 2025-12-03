@@ -180,7 +180,7 @@ if triton is not None:
                     ow_n = q_idx * stride_w - pad_w + s_n * dil_w
                     X_ptrs_n = X + n_idx * stride_x_n + c_n * stride_x_c + oh_n * stride_x_h + ow_n * stride_x_w
                     x_mask_n = (n_idx < N) & (oh_n >= 0) & (ow_n >= 0) & (oh_n < H) & (ow_n < W_in) & k_mask_n[None, :]
-                    x_nxt    = tl.where(x_mask_n, tl.load(X_ptrs_n, mask=x_mask_n, other=0.0), 0.0)
+                    x_nxt    = tl.load(X_ptrs_n, mask=x_mask_n, other=0.0)
 
                     acc += tl.dot(x_cur, w_cur)
 
