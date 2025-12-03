@@ -124,7 +124,6 @@ if triton is not None:
 
             offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            offs_k = tl.arange(0, BLOCK_K)
 
             n_idx = offs_m[:, None] // (P * Q)
             pq    = offs_m[:, None] %  (P * Q)
@@ -161,7 +160,7 @@ if triton is not None:
                 ow = q_idx * stride_w - pad_w + s * dil_w
                 X_ptrs = X + n_idx * stride_x_n + c * stride_x_c + oh * stride_x_h + ow * stride_x_w
                 x_mask = (n_idx < N) & (oh >= 0) & (ow >= 0) & (oh < H) & (ow < W_in) & k_mask[None, :]
-                x_cur  = tl.where(x_mask, tl.load(X_ptrs, mask=x_mask, other=0.0), 0.0)
+                x_cur  = tl.load(X_ptrs, mask=x_mask, other=0.0)
 
                 k0 += BLOCK_K
 
