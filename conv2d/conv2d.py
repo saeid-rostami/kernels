@@ -17,7 +17,6 @@ except Exception:
     tl = None
 
 
-
 def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int, ref: torch.Tensor):
     eps = {torch.float16: 2**-10, torch.bfloat16: 2**-7, torch.float32: 2**-23}.get(dtype, 2**-10)
     rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
@@ -97,7 +96,8 @@ if triton is not None:
 
     @triton.autotune(
         configs=AUTOTUNE_CONFIGS,
-        key=["N","C","H","W_in","K_out","R","S","stride_h","stride_w","pad_h","pad_w","dil_h","dil_w"]
+        key=["N","C","H","W_in","K_out","R","S",
+             "stride_h","stride_w","pad_h","pad_w","dil_h","dil_w"]
     )
     @triton.jit
     def _conv2d_kernel(
@@ -110,103 +110,152 @@ if triton is not None:
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, HAS_BIAS: tl.constexpr, ACT_TYPE: tl.constexpr,
     ):
-        pid  = tl.program_id(axis=0)
-        nprog = tl.num_programs(0) 
+        # ---- 1) Map 1D program id -> (pid_m, pid_n) tile coordinates ----
+        pid = tl.program_id(axis=0)
 
-        num_pid_m = tl.cdiv(N * P * Q, BLOCK_M)
-        num_pid_n = tl.cdiv(K_out,     BLOCK_N)
-        total_tiles = num_pid_m * num_pid_n
+        num_pid_m = tl.cdiv(N * P * Q, BLOCK_M)   # tiles along M = N*P*Q
+        num_pid_n = tl.cdiv(K_out,     BLOCK_N)   # tiles along N = K_out
 
-        tile_id = pid
-        while tile_id < total_tiles:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id %  num_pid_n
+        pid_m = pid // num_pid_n
+        pid_n = pid %  num_pid_n
 
-            offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        # If grid is rounded up, some pids may be out of range → early exit.
+        if pid_m >= num_pid_m:
+            return
 
-            n_idx = offs_m[:, None] // (P * Q)
-            pq    = offs_m[:, None] %  (P * Q)
-            p_idx = pq // Q
-            q_idx = pq %  Q
+        # ---- 2) Compute logical indices for this output tile ----
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-            Y_ptrs = (
-                Y
-                + n_idx * stride_y_n
-                + offs_n[None, :] * stride_y_k
-                + p_idx * stride_y_p
-                + q_idx * stride_y_q
+        # Decode offs_m -> (n_idx, p_idx, q_idx)
+        n_idx = offs_m[:, None] // (P * Q)
+        pq    = offs_m[:, None] %  (P * Q)
+        p_idx = pq // Q
+        q_idx = pq %  Q
+
+        # Pointers to the output tile
+        Y_ptrs = (
+            Y
+            + n_idx * stride_y_n
+            + offs_n[None, :] * stride_y_k
+            + p_idx * stride_y_p
+            + q_idx * stride_y_q
+        )
+
+        # Accumulator in FP32
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # Total reduction length
+        K_red = C * R * S
+
+        # ---- 3) K-reduction loop with register double-buffering ----
+        k0 = 0
+        if K_red > 0:
+            # Static k offsets for this block of K
+            offs_k = tl.arange(0, BLOCK_K)
+            kred   = k0 + offs_k
+            k_mask = kred < K_red
+
+            # First load of weights: shape [BLOCK_K, BLOCK_N]
+            WK_ptrs = WK + kred[:, None] * stride_wk_kred \
+                          + offs_n[None, :] * stride_wk_kout
+            w_mask  = k_mask[:, None] & (offs_n[None, :] < K_out)
+            w_cur   = tl.load(WK_ptrs, mask=w_mask, other=0.0)
+
+            # Decode (c, r, s) for this block of K
+            c  = kred // (R * S)
+            rs = kred %  (R * S)
+            r  = rs // S
+            s  = rs %  S
+
+            # Compute input spatial positions for this tile
+            oh = p_idx * stride_h - pad_h + r * dil_h
+            ow = q_idx * stride_w - pad_w + s * dil_w
+
+            # First load of input: shape [BLOCK_M, BLOCK_K]
+            X_ptrs = (
+                X
+                + n_idx * stride_x_n
+                + c * stride_x_c
+                + oh * stride_x_h
+                + ow * stride_x_w
             )
+            x_mask = (
+                (n_idx < N)
+                & (oh >= 0) & (ow >= 0)
+                & (oh < H) & (ow < W_in)
+                & k_mask[None, :]
+            )
+            x_cur = tl.load(X_ptrs, mask=x_mask, other=0.0)
 
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            k0 += BLOCK_K
 
-            K_red = C * R * S
+            # Steady-state: prefetch next (x, w) while computing on current
+            while k0 < K_red:
+                kred_n   = k0 + offs_k
+                k_mask_n = kred_n < K_red
 
-            k0 = 0
-            if K_red > 0:
-                offs_k = tl.arange(0, BLOCK_K)
-                kred   = k0 + offs_k
-                k_mask = kred < K_red
+                WK_ptrs_n = WK + kred_n[:, None] * stride_wk_kred \
+                                + offs_n[None, :] * stride_wk_kout
+                w_mask_n  = k_mask_n[:, None] & (offs_n[None, :] < K_out)
+                w_nxt     = tl.load(WK_ptrs_n, mask=w_mask_n, other=0.0)
 
-                WK_ptrs = WK + kred[:, None] * stride_wk_kred + offs_n[None, :] * stride_wk_kout
-                w_mask  = k_mask[:, None] & (offs_n[None, :] < K_out)
-                w_cur   = tl.load(WK_ptrs, mask=w_mask, other=0.0)
+                c_n  = kred_n // (R * S)
+                rs_n = kred_n %  (R * S)
+                r_n  = rs_n // S
+                s_n  = rs_n %  S
+                oh_n = p_idx * stride_h - pad_h + r_n * dil_h
+                ow_n = q_idx * stride_w - pad_w + s_n * dil_w
 
-                c  = kred // (R * S)
-                rs = kred %  (R * S)
-                r  = rs // S
-                s  = rs %  S
-                oh = p_idx * stride_h - pad_h + r * dil_h
-                ow = q_idx * stride_w - pad_w + s * dil_w
-                X_ptrs = X + n_idx * stride_x_n + c * stride_x_c + oh * stride_x_h + ow * stride_x_w
-                x_mask = (n_idx < N) & (oh >= 0) & (ow >= 0) & (oh < H) & (ow < W_in) & k_mask[None, :]
-                x_cur  = tl.load(X_ptrs, mask=x_mask, other=0.0)
+                X_ptrs_n = (
+                    X
+                    + n_idx * stride_x_n
+                    + c_n * stride_x_c
+                    + oh_n * stride_x_h
+                    + ow_n * stride_x_w
+                )
+                x_mask_n = (
+                    (n_idx < N)
+                    & (oh_n >= 0) & (ow_n >= 0)
+                    & (oh_n < H) & (ow_n < W_in)
+                    & k_mask_n[None, :]
+                )
+                x_nxt = tl.load(X_ptrs_n, mask=x_mask_n, other=0.0)
 
-                k0 += BLOCK_K
-
-                while k0 < K_red:
-                    kred_n   = k0 + offs_k
-                    k_mask_n = kred_n < K_red
-
-                    WK_ptrs_n = WK + kred_n[:, None] * stride_wk_kred + offs_n[None, :] * stride_wk_kout
-                    w_mask_n  = k_mask_n[:, None] & (offs_n[None, :] < K_out)
-                    w_nxt     = tl.load(WK_ptrs_n, mask=w_mask_n, other=0.0)
-
-                    c_n  = kred_n // (R * S)
-                    rs_n = kred_n %  (R * S)
-                    r_n  = rs_n // S
-                    s_n  = rs_n %  S
-                    oh_n = p_idx * stride_h - pad_h + r_n * dil_h
-                    ow_n = q_idx * stride_w - pad_w + s_n * dil_w
-                    X_ptrs_n = X + n_idx * stride_x_n + c_n * stride_x_c + oh_n * stride_x_h + ow_n * stride_x_w
-                    x_mask_n = (n_idx < N) & (oh_n >= 0) & (ow_n >= 0) & (oh_n < H) & (ow_n < W_in) & k_mask_n[None, :]
-                    x_nxt    = tl.load(X_ptrs_n, mask=x_mask_n, other=0.0)
-
-                    acc += tl.dot(x_cur, w_cur)
-
-                    x_cur, w_cur = x_nxt, w_nxt
-                    k0 += BLOCK_K
-
+                # FMA on current tiles
                 acc += tl.dot(x_cur, w_cur)
 
-            if HAS_BIAS:
-                b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
-                acc += b[None, :]
+                # Rotate buffers
+                x_cur, w_cur = x_nxt, w_nxt
+                k0 += BLOCK_K
 
-            if ACT_TYPE == 1:
-                acc = tl.maximum(acc, 0)
-            elif ACT_TYPE == 2:
-                acc = tl.minimum(tl.maximum(acc, 0), 6)
-            elif ACT_TYPE == 3:
-                acc = 0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
+            # Final dot on last prefetched tiles
+            acc += tl.dot(x_cur, w_cur)
 
-            tl.store(
-                Y_ptrs,
-                acc,
-                mask=(n_idx < N) & (p_idx < P) & (q_idx < Q) & (offs_n[None, :] < K_out),
-            )
+        # ---- 4) Optional bias and activation ----
+        if HAS_BIAS:
+            b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
+            acc += b[None, :]
 
-            tile_id += nprog
+        if ACT_TYPE == 1:        # ReLU
+            acc = tl.maximum(acc, 0)
+        elif ACT_TYPE == 2:      # ReLU6
+            acc = tl.minimum(tl.maximum(acc, 0), 6)
+        elif ACT_TYPE == 3:      # GELU (approx)
+            acc = 0.5 * acc * (1.0 + _tanh(0.7978845608 *
+                                           (acc + 0.044715 * acc * acc * acc)))
+
+        # ---- 5) Store result ----
+        tl.store(
+            Y_ptrs,
+            acc,
+            mask=(
+                (n_idx < N)
+                & (p_idx < P)
+                & (q_idx < Q)
+                & (offs_n[None, :] < K_out)
+            ),
+        )
 
 
 def _launch_common(x, w_k, bias_fp32, y, N, C, H, W_in, K_out, R, S, P, Q,
